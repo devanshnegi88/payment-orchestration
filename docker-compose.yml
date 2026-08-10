@@ -1,0 +1,133 @@
+version: "3.9"
+
+services:
+  api:
+    build: { context: ., dockerfile: Dockerfile }
+    container_name: payflow_api
+    ports: ["8000:8000"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payflow:payflow@postgres:5432/payflow
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+    networks: [payflow_net]
+
+  worker:
+    build: { context: ., dockerfile: Dockerfile }
+    container_name: payflow_worker
+    command: celery -A app.workers.tasks.celery_app worker --loglevel=info --concurrency=4
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payflow:payflow@postgres:5432/payflow
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: unless-stopped
+    networks: [payflow_net]
+
+  beat:
+    build: { context: ., dockerfile: Dockerfile }
+    container_name: payflow_beat
+    command: celery -A app.workers.tasks.celery_app beat --loglevel=info
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payflow:payflow@postgres:5432/payflow
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+    depends_on: [worker]
+    restart: unless-stopped
+    networks: [payflow_net]
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: payflow_postgres
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: payflow
+      POSTGRES_PASSWORD: payflow
+      POSTGRES_DB: payflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payflow -d payflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    command: >
+      postgres
+        -c max_connections=100
+        -c shared_buffers=256MB
+        -c effective_cache_size=768MB
+    networks: [payflow_net]
+
+  redis:
+    image: redis:7-alpine
+    container_name: payflow_redis
+    ports: ["6379:6379"]
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [payflow_net]
+
+  flower:
+    build: { context: ., dockerfile: Dockerfile }
+    container_name: payflow_flower
+    command: celery -A app.workers.tasks.celery_app flower --port=5555
+    ports: ["5555:5555"]
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+    depends_on: [redis]
+    networks: [payflow_net]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: payflow_prometheus
+    ports: ["9090:9090"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command: ["--config.file=/etc/prometheus/prometheus.yml",
+              "--storage.tsdb.retention.time=15d"]
+    networks: [payflow_net]
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: payflow_grafana
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: payflow_admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on: [prometheus]
+    networks: [payflow_net]
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  payflow_net:
+    driver: bridge
